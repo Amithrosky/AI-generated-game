@@ -1,0 +1,414 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Grandma's Basement - 3D Escape</title>
+    <style>
+        body {
+            margin: 0;
+            background: #1a1a1a;
+            color: white;
+            font-family: 'Courier New', Courier, monospace;
+            overflow: hidden;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+        canvas {
+            background: #000;
+            box-shadow: 0 0 20px rgba(0,0,0,0.8);
+            cursor: none;
+        }
+        #ui {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 20px;
+            text-shadow: 2px 2px 0 #000;
+            pointer-events: none;
+        }
+        #message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 40px;
+            background: rgba(0,0,0,0.8);
+            padding: 20px;
+            text-align: center;
+            display: none;
+            border: 2px solid white;
+        }
+        .key-icon {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            background: lime;
+            border-radius: 50%;
+            margin-right: 10px;
+            box-shadow: 0 0 10px lime;
+        }
+        #controls-hint {
+            margin-top: 10px;
+            color: #888;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="ui">
+        <div id="status">Find the KEY</div>
+        <div id="health">Health: 100%</div>
+    </div>
+
+    <canvas id="screen" width="800" height="600"></canvas>
+    
+    <div id="message">
+        <h1 id="msg-title">GAME OVER</h1>
+        <p>Press R to Restart</p>
+    </div>
+
+    <div id="controls-hint">CLICK TO START | WASD to Move | MOUSE to Look</div>
+
+    <script>
+        // --- CONFIGURATION ---
+        const SCREEN_W = 800;
+        const SCREEN_H = 600;
+        const TICK_RATE = 30;
+        const FOV = Math.PI / 3;
+        const BLOCK_SIZE = 64;
+        const MAP_SIZE = 16;
+        const MOVEMENT_SPEED = 4.0;
+        const ROTATION_SPEED = 0.08;
+        const ENEMY_SPEED = 2.5;
+
+        // --- MAP GENERATION (1=Wall, 0=Empty, 2=Win Door) ---
+        // A simple manually designed maze
+        const mapData = [
+            1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+            1,0,0,0,0,0,1,0,0,0,0,0,0,0,0,1,
+            1,0,1,1,1,0,1,0,1,1,1,1,1,1,0,1,
+            1,0,1,0,0,0,1,0,0,0,0,0,0,1,0,1,
+            1,0,1,0,1,1,1,1,1,1,1,1,0,1,0,1,
+            1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1,
+            1,0,1,1,1,1,0,1,1,1,0,1,1,1,0,1,
+            1,0,1,0,0,0,0,0,0,1,0,1,0,0,0,1,
+            1,0,1,0,1,1,0,1,0,1,0,1,0,1,1,1,
+            1,0,0,0,1,0,0,1,0,0,0,0,0,0,0,1,
+            1,1,1,1,1,0,1,1,1,1,0,1,1,1,0,1,
+            1,0,0,0,0,0,0,0,0,1,0,1,0,0,0,1,
+            1,0,1,1,1,1,1,1,0,1,0,0,0,1,0,1,
+            1,0,0,0,0,0,0,0,0,1,1,1,1,1,0,1,
+            1,0,1,1,1,1,1,1,0,0,0,0,0,0,2,1,
+            1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1
+        ];
+
+        // --- STATE ---
+        let player = { x: 3 * BLOCK_SIZE, y: 3 * BLOCK_SIZE, dir: 0, rot: 0 };
+        let enemy = { x: 14 * BLOCK_SIZE, y: 13 * BLOCK_SIZE, active: true };
+        let keyItem = { x: 14 * BLOCK_SIZE, y: 2 * BLOCK_SIZE, collected: false };
+        let gameState = "MENU"; // MENU, PLAYING, GAMEOVER, WIN
+        let health = 100;
+        let keysPressed = {};
+
+        const canvas = document.getElementById('screen');
+        const ctx = canvas.getContext('2d', { alpha: false }); // Optimize for speed
+
+        // --- INPUT ---
+        document.addEventListener('keydown', e => keysPressed[e.code] = true);
+        document.addEventListener('keyup', e => keysPressed[e.code] = false);
+        document.addEventListener('keydown', e => {
+            if (e.code === 'KeyR' && (gameState === 'GAMEOVER' || gameState === 'WIN')) resetGame();
+        });
+        
+        canvas.addEventListener('click', () => {
+            if (gameState === 'MENU') {
+                gameState = 'PLAYING';
+                resetGame();
+            }
+            canvas.requestPointerLock();
+        });
+
+        document.addEventListener('mousemove', e => {
+            if (document.pointerLockElement === canvas && gameState === 'PLAYING') {
+                player.dir += e.movementX * 0.002;
+            }
+        });
+
+        // --- RAYCASTING ENGINE ---
+        function castRays() {
+            // Ceiling and Floor
+            ctx.fillStyle = "#333"; // Ceiling
+            ctx.fillRect(0, 0, SCREEN_W, SCREEN_H / 2);
+            ctx.fillStyle = "#2a2a2a"; // Floor
+            ctx.fillRect(0, SCREEN_H / 2, SCREEN_W, SCREEN_H / 2);
+
+            for (let x = 0; x < SCREEN_W; x += 4) { // Optimization: Cast every 4th pixel
+                const rayAngle = (player.dir - FOV / 2.0) + (x / SCREEN_W) * FOV;
+                const eyeX = Math.cos(rayAngle);
+                const eyeY = Math.sin(rayAngle);
+
+                let distToWall = 0;
+                let hitWall = false;
+                let texture = 0; // 0=none, 1=wall, 2=door
+
+                let testX = player.x;
+                let testY = player.y;
+
+                // Simple DDA-ish Stepping
+                while (!hitWall && distToWall < 800) {
+                    distToWall += 2;
+                    testX = Math.floor((player.x + eyeX * distToWall) / BLOCK_SIZE);
+                    testY = Math.floor((player.y + eyeY * distToWall) / BLOCK_SIZE);
+
+                    if (testX < 0 || testX >= MAP_SIZE || testY < 0 || testY >= MAP_SIZE) {
+                        hitWall = true;
+                        distToWall = 800;
+                    } else {
+                        const block = mapData[testY * MAP_SIZE + testX];
+                        if (block > 0) {
+                            hitWall = true;
+                            texture = block;
+                        }
+                    }
+                }
+
+                // Fish-eye correction
+                const correctDist = distToWall * Math.cos(rayAngle - player.dir);
+                
+                // Calculate height
+                const ceiling = SCREEN_H / 2.0 - SCREEN_H / correctDist * (BLOCK_SIZE / 2);
+                const floor = SCREEN_H - ceiling;
+                const height = floor - ceiling;
+
+                // Wall Colors
+                let color;
+                if (texture === 2) {
+                    color = `rgb(0, 0, ${Math.min(255, 40000 / correctDist)})`; // Blue Door
+                } else {
+                    // Wall shading based on distance
+                    const shade = Math.min(200, 30000 / correctDist); 
+                    color = `rgb(${shade}, ${shade}, ${shade})`;
+                }
+
+                ctx.fillStyle = color;
+                ctx.fillRect(x, ceiling, 4, height);
+            }
+        }
+
+        // --- SPRITE RENDERING (Simple Billboarding) ---
+        function drawSprite(obj, color, size, label) {
+            // Calculate distance and angle relative to player
+            const dx = obj.x - player.x;
+            const dy = obj.y - player.y;
+            const dist = Math.sqrt(dx*dx + dy*dy);
+
+            // Angle of sprite relative to player
+            let spriteAngle = Math.atan2(dy, dx) - player.dir;
+            
+            // Normalize angle
+            while (spriteAngle < -Math.PI) spriteAngle += 2 * Math.PI;
+            while (spriteAngle > Math.PI) spriteAngle -= 2 * Math.PI;
+
+            // Only draw if in front
+            if (Math.abs(spriteAngle) < FOV / 1.5) {
+                const screenH = SCREEN_H;
+                const spriteH = (SCREEN_H / dist) * BLOCK_SIZE;
+                const spriteW = spriteH * size; 
+                const spriteTop = (SCREEN_H - spriteH) / 2;
+                
+                // X position on screen
+                const screenX = (0.5 * (spriteAngle / (FOV / 2)) + 0.5) * SCREEN_W;
+
+                ctx.fillStyle = color;
+                ctx.fillRect(screenX - spriteW / 2, spriteTop, spriteW, spriteH);
+                
+                // Simple eyes for enemy
+                if (label === "ENEMY") {
+                    ctx.fillStyle = "yellow";
+                    ctx.fillRect(screenX - spriteW/4, spriteTop + spriteH/4, spriteW/5, spriteW/5);
+                    ctx.fillRect(screenX + spriteW/12, spriteTop + spriteH/4, spriteW/5, spriteW/5);
+                }
+            }
+        }
+
+        // --- LOGIC ---
+        function update() {
+            if (gameState !== 'PLAYING') return;
+
+            // Movement
+            let moveStep = 0;
+            if (keysPressed['KeyW']) moveStep = MOVEMENT_SPEED;
+            if (keysPressed['KeyS']) moveStep = -MOVEMENT_SPEED;
+            
+            let strafeStep = 0;
+            if (keysPressed['KeyA']) strafeStep = -MOVEMENT_SPEED;
+            if (keysPressed['KeyD']) strafeStep = MOVEMENT_SPEED;
+
+            const newX = player.x + Math.cos(player.dir) * moveStep + Math.cos(player.dir + Math.PI/2) * strafeStep;
+            const newY = player.y + Math.sin(player.dir) * moveStep + Math.sin(player.dir + Math.PI/2) * strafeStep;
+
+            // Collision Check (Walls)
+            const mapX = Math.floor(newX / BLOCK_SIZE);
+            const mapY = Math.floor(newY / BLOCK_SIZE);
+            
+            let collided = false;
+            if (mapData[mapY * MAP_SIZE + mapX] === 1) collided = true;
+            
+            // Door Collision
+            if (mapData[mapY * MAP_SIZE + mapX] === 2) {
+                if (keyItem.collected) {
+                    gameState = 'WIN';
+                    showEndScreen("ESCAPED!", "lime");
+                } else {
+                    document.getElementById('status').innerText = "LOCKED - Find the KEY";
+                    collided = true;
+                }
+            }
+
+            if (!collided) {
+                player.x = newX;
+                player.y = newY;
+            }
+
+            // Key Collection
+            const distToKey = Math.hypot(player.x - keyItem.x, player.y - keyItem.y);
+            if (!keyItem.collected && distToKey < BLOCK_SIZE / 2) {
+                keyItem.collected = true;
+                document.getElementById('status').innerHTML = "<span class='key-icon'></span> KEY FOUND! Find the Blue Door.";
+                playSound('pickup');
+            }
+
+            // Enemy AI (Granny)
+            const distToEnemy = Math.hypot(player.x - enemy.x, player.y - enemy.y);
+            
+            if (distToEnemy < 600) { // She sees you
+                const angleToPlayer = Math.atan2(player.y - enemy.y, player.x - enemy.x);
+                
+                let ex = enemy.x + Math.cos(angleToPlayer) * ENEMY_SPEED;
+                let ey = enemy.y + Math.sin(angleToPlayer) * ENEMY_SPEED;
+                
+                // Simple wall collision for enemy
+                if (mapData[Math.floor(ey/BLOCK_SIZE) * MAP_SIZE + Math.floor(ex/BLOCK_SIZE)] !== 1) {
+                    enemy.x = ex;
+                    enemy.y = ey;
+                }
+
+                // Catch Player
+                if (distToEnemy < 30) {
+                    health -= 10;
+                    document.getElementById('health').innerText = `Health: ${health}%`;
+                    document.getElementById('health').style.color = 'red';
+                    
+                    // Push back
+                    player.x -= Math.cos(angleToPlayer) * 50;
+                    player.y -= Math.sin(angleToPlayer) * 50;
+                    playSound('hit');
+
+                    if (health <= 0) {
+                        gameState = 'GAMEOVER';
+                        showEndScreen("CAUGHT BY GRANNY", "red");
+                    }
+                }
+            }
+        }
+
+        function draw() {
+            // Clear
+            ctx.fillStyle = "#000";
+            ctx.fillRect(0, 0, SCREEN_W, SCREEN_H);
+
+            if (gameState === 'MENU') {
+                ctx.fillStyle = "white";
+                ctx.font = "40px Courier New";
+                ctx.textAlign = "center";
+                ctx.fillText("GRANDMA'S BASEMENT", SCREEN_W/2, SCREEN_H/2 - 20);
+                ctx.font = "20px Courier New";
+                ctx.fillText("Click to Start", SCREEN_W/2, SCREEN_H/2 + 30);
+                return;
+            }
+
+            // 1. Draw 3D World
+            castRays();
+
+            // 2. Draw Items
+            if (!keyItem.collected) {
+                drawSprite(keyItem, "#0f0", 0.5, "KEY"); // Green Key
+            }
+
+            // 3. Draw Enemy
+            drawSprite(enemy, "#a00", 0.8, "ENEMY"); // Red Granny
+            
+            // 4. Weapon/Hand (Visual anchor)
+            ctx.fillStyle = "#555";
+            // Bobbing effect
+            const bob = Math.sin(Date.now() / 150) * (keysPressed['KeyW'] || keysPressed['KeyS'] ? 10 : 0);
+            ctx.fillRect(SCREEN_W - 200, SCREEN_H - 150 + bob, 100, 150);
+        }
+
+        // --- UTILS ---
+        function showEndScreen(text, color) {
+            document.exitPointerLock();
+            const msg = document.getElementById('message');
+            const title = document.getElementById('msg-title');
+            msg.style.display = 'block';
+            msg.style.borderColor = color;
+            title.innerText = text;
+            title.style.color = color;
+        }
+
+        function resetGame() {
+            player = { x: 3 * BLOCK_SIZE, y: 3 * BLOCK_SIZE, dir: 0, rot: 0 };
+            enemy = { x: 14 * BLOCK_SIZE, y: 13 * BLOCK_SIZE, active: true };
+            keyItem = { x: 14 * BLOCK_SIZE, y: 2 * BLOCK_SIZE, collected: false };
+            health = 100;
+            gameState = 'PLAYING';
+            document.getElementById('message').style.display = 'none';
+            document.getElementById('status').innerText = "Find the KEY";
+            document.getElementById('health').innerText = "Health: 100%";
+            document.getElementById('health').style.color = "white";
+            canvas.requestPointerLock();
+        }
+
+        // Simple Synth Audio
+        const AudioContext = window.AudioContext || window.webkitAudioContext;
+        const audioCtx = new AudioContext();
+        
+        function playSound(type) {
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.connect(gain);
+            gain.connect(audioCtx.destination);
+
+            const now = audioCtx.currentTime;
+            
+            if (type === 'hit') {
+                osc.type = 'sawtooth';
+                osc.frequency.setValueAtTime(100, now);
+                osc.frequency.exponentialRampToValueAtTime(0.01, now + 0.3);
+                gain.gain.setValueAtTime(0.5, now);
+                gain.gain.linearRampToValueAtTime(0, now + 0.3);
+                osc.start(now);
+                osc.stop(now + 0.3);
+            } else if (type === 'pickup') {
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(600, now);
+                osc.frequency.linearRampToValueAtTime(1200, now + 0.1);
+                gain.gain.setValueAtTime(0.3, now);
+                gain.gain.linearRampToValueAtTime(0, now + 0.1);
+                osc.start(now);
+                osc.stop(now + 0.1);
+            }
+        }
+
+        // Game Loop
+        setInterval(() => {
+            update();
+            draw();
+        }, 1000 / TICK_RATE);
+
+    </script>
+</body>
+</html>
